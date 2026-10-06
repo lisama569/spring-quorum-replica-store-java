@@ -55,8 +55,19 @@ public class ReplicaNode {
     private long commitIndex;
     private long lastApplied;
     private final Map<String, String> kv = new HashMap<>();
-    /** 已应用请求及其结果，用于幂等去重（随状态机持久）。 */
-    private final Map<String, WriteOutcome> appliedRequests = new HashMap<>();
+    /** 每个键的当前版本（删除后保留墓碑版本，保证版本只增不减；随状态机持久）。 */
+    private final Map<String, Long> versions = new HashMap<>();
+    /** 已应用请求及其内容指纹与结果，用于幂等去重（随状态机持久）。 */
+    private final Map<String, AppliedRequest> appliedRequests = new HashMap<>();
+
+    /** 已应用请求的内容指纹与首次结果：同 requestId 重提时逐字段比对。 */
+    private record AppliedRequest(String key, String value, boolean delete,
+                                  Long expectedVersion, WriteOutcome outcome) {
+        boolean matches(String key, String value, boolean delete, Long expectedVersion) {
+            return this.key.equals(key) && this.value.equals(value) && this.delete == delete
+                    && java.util.Objects.equals(this.expectedVersion, expectedVersion);
+        }
+    }
 
     // ---- 易失状态 ----
     private Role role = Role.FOLLOWER;
@@ -349,20 +360,41 @@ public class ReplicaNode {
         if (NOOP_KEY.equals(entry.key())) {
             return;
         }
-        kv.put(entry.key(), entry.value());
+        // 版本只增不减：删除也推进版本并保留墓碑，重建时继续递增
+        long newVersion = versions.getOrDefault(entry.key(), 0L) + 1;
+        versions.put(entry.key(), newVersion);
+        if (entry.delete()) {
+            kv.remove(entry.key());
+        } else {
+            kv.put(entry.key(), entry.value());
+        }
         WriteOutcome outcome = WriteOutcome.ok(entry.requestId(), entry.term(), entry.index(),
-                "applied-by-commit");
-        appliedRequests.put(entry.requestId(), outcome);
-        log.info("node={} event=applied requestId={} term={} commitIndex={} key={}",
-                id, entry.requestId(), entry.term(), entry.index(), entry.key());
+                "applied-by-commit", newVersion);
+        appliedRequests.put(entry.requestId(), new AppliedRequest(
+                entry.key(), entry.value(), entry.delete(), entry.expectedVersion(), outcome));
+        log.info("node={} event=applied requestId={} term={} commitIndex={} key={} version={} delete={}",
+                id, entry.requestId(), entry.term(), entry.index(), entry.key(),
+                newVersion, entry.delete());
     }
 
     // ------------------------------------------------------------------
     // 客户端接口
     // ------------------------------------------------------------------
 
-    /** 客户端写请求（仅主节点可成功）。 */
+    /** 客户端写请求（仅主节点可成功）。兼容旧调用方：无条件写入、不带客户端任期。 */
     public WriteOutcome clientWrite(String key, String value, String requestId) {
+        return clientWrite(key, value, requestId, null, null, false);
+    }
+
+    /**
+     * 客户端写请求（仅主节点可成功）。
+     *
+     * @param expectedVersion 期望的键当前版本；null 表示无条件写入。键不存在视为版本 0
+     * @param clientTerm      调用方缓存的任期；null 表示不携带。落后于当前任期将被拒绝
+     * @param delete          true 时按同一受版本约束路径删除该键
+     */
+    public WriteOutcome clientWrite(String key, String value, String requestId,
+                                    Long expectedVersion, Long clientTerm, boolean delete) {
         if (!alive) {
             return WriteOutcome.rejected(requestId, currentTerm, commitIndex,
                     RejectionReason.NODE_UNAVAILABLE, "node=" + id + " crashed");
@@ -372,15 +404,61 @@ public class ReplicaNode {
                     RejectionReason.NOT_LEADER,
                     "node=" + id + " role=" + role + " leader=" + currentLeader);
         }
-        WriteOutcome previous = appliedRequests.get(requestId);
-        if (previous != null) {
-            log.info("node={} event=write-duplicate requestId={} term={} commitIndex={}",
-                    id, requestId, currentTerm, previous.commitIndex());
-            return new WriteOutcome(true, requestId, currentTerm, previous.commitIndex(),
-                    RejectionReason.DUPLICATE_REQUEST,
-                    "idempotent-replay of commitIndex=" + previous.commitIndex());
+        // 客户端任期检查：落后于当前任期直接明确拒绝，不产生任何状态变更
+        if (clientTerm != null && clientTerm < currentTerm) {
+            log.info("node={} event=write-rejected requestId={} clientTerm={} term={} reason={}",
+                    id, requestId, clientTerm, currentTerm, RejectionReason.STALE_TERM);
+            return WriteOutcome.rejected(requestId, currentTerm, commitIndex,
+                    RejectionReason.STALE_TERM,
+                    "clientTerm=" + clientTerm + " < currentTerm=" + currentTerm);
         }
-        LogEntry entry = new LogEntry(currentTerm, lastLogIndex() + 1, key, value, requestId);
+        // 幂等去重：同 requestId 只有内容完全一致才回放首次结果，否则明确拒绝
+        String effectiveValue = delete ? "" : value;
+        AppliedRequest previous = appliedRequests.get(requestId);
+        if (previous != null) {
+            if (previous.matches(key, effectiveValue, delete, expectedVersion)) {
+                log.info("node={} event=write-duplicate requestId={} term={} commitIndex={} version={}",
+                        id, requestId, currentTerm, previous.outcome().commitIndex(),
+                        previous.outcome().version());
+                return new WriteOutcome(true, requestId, currentTerm,
+                        previous.outcome().commitIndex(),
+                        RejectionReason.DUPLICATE_REQUEST,
+                        "idempotent-replay of commitIndex=" + previous.outcome().commitIndex(),
+                        previous.outcome().version(), -1);
+            }
+            log.info("node={} event=write-rejected requestId={} term={} reason={} firstKey={}",
+                    id, requestId, currentTerm, RejectionReason.REQUEST_CONFLICT, previous.key());
+            return WriteOutcome.rejected(requestId, currentTerm, commitIndex,
+                    RejectionReason.REQUEST_CONFLICT,
+                    "requestId already applied with different content, firstKey=" + previous.key());
+        }
+        // 删除要求键当前存在：对不存在的键删除按 KEY_NOT_FOUND 拒绝（墓碑版本一并返回）
+        if (delete && !kv.containsKey(key)) {
+            long currentVersion = versions.getOrDefault(key, 0L);
+            log.info("node={} event=write-rejected requestId={} term={} key={} "
+                            + "currentVersion={} reason={}",
+                    id, requestId, currentTerm, key, currentVersion,
+                    RejectionReason.KEY_NOT_FOUND);
+            return WriteOutcome.rejected(requestId, currentTerm, commitIndex,
+                    RejectionReason.KEY_NOT_FOUND,
+                    "delete of absent key, tombstoneVersion=" + currentVersion, currentVersion);
+        }
+        // 条件写入：期望版本与当前版本比对（键不存在视为 0，删除后保留墓碑版本）
+        if (expectedVersion != null) {
+            long currentVersion = versions.getOrDefault(key, 0L);
+            if (expectedVersion != currentVersion) {
+                RejectionReason reason = kv.containsKey(key)
+                        ? RejectionReason.VERSION_MISMATCH : RejectionReason.KEY_NOT_FOUND;
+                log.info("node={} event=write-rejected requestId={} term={} key={} "
+                                + "expectedVersion={} currentVersion={} reason={}",
+                        id, requestId, currentTerm, key, expectedVersion, currentVersion, reason);
+                return WriteOutcome.rejected(requestId, currentTerm, commitIndex, reason,
+                        "expectedVersion=" + expectedVersion + " currentVersion=" + currentVersion,
+                        currentVersion);
+            }
+        }
+        LogEntry entry = new LogEntry(currentTerm, lastLogIndex() + 1, key, effectiveValue,
+                requestId, expectedVersion, delete);
         appendLocal(entry);
         matchIndex.put(id, entry.index());
         for (String peer : allNodes) {
@@ -390,10 +468,12 @@ public class ReplicaNode {
         }
         advanceCommitByQuorum();
         if (commitIndex >= entry.index()) {
+            long newVersion = versions.getOrDefault(key, 0L);
             WriteOutcome outcome = WriteOutcome.ok(requestId, currentTerm, commitIndex,
-                    "quorum-replicated commitIndex=" + commitIndex);
-            log.info("node={} event=write-committed requestId={} term={} commitIndex={}",
-                    id, requestId, currentTerm, commitIndex);
+                    "quorum-replicated commitIndex=" + commitIndex, newVersion);
+            log.info("node={} event=write-committed requestId={} term={} commitIndex={} "
+                            + "key={} version={} delete={}",
+                    id, requestId, currentTerm, commitIndex, key, newVersion, delete);
             return outcome;
         }
         log.info("node={} event=write-rejected requestId={} term={} commitIndex={} reason={}",
@@ -430,11 +510,15 @@ public class ReplicaNode {
                     RejectionReason.NO_QUORUM,
                     "read-index confirmations=" + confirmations + " quorum=" + quorum);
         }
+        boolean found = kv.containsKey(key);
         String value = kv.get(key);
-        log.info("node={} event=read-served requestId={} term={} commitIndex={} key={} hit={}",
-                id, requestId, currentTerm, commitIndex, key, value != null);
+        long version = found ? versions.getOrDefault(key, 0L) : 0;
+        log.info("node={} event=read-served requestId={} term={} commitIndex={} key={} "
+                        + "hit={} version={}",
+                id, requestId, currentTerm, commitIndex, key, found, version);
         return ReadOutcome.ok(key, value, currentTerm, commitIndex,
-                "read-index quorum=" + confirmations + " commitIndex=" + commitIndex);
+                "read-index quorum=" + confirmations + " commitIndex=" + commitIndex,
+                found, version);
     }
 
     // ------------------------------------------------------------------
@@ -508,5 +592,24 @@ public class ReplicaNode {
     /** 日志条目快照（测试构造乱序消息用）。 */
     List<LogEntry> logSnapshot() {
         return List.copyOf(entries);
+    }
+
+    /**
+     * 主节点视角的各从副本复制进度：peer -> [nextIndex, matchIndex]。
+     * 非主节点返回空表。
+     */
+    public Map<String, long[]> followerProgress() {
+        if (role != Role.LEADER) {
+            return Map.of();
+        }
+        Map<String, long[]> result = new java.util.LinkedHashMap<>();
+        for (String peer : allNodes) {
+            if (!peer.equals(id)) {
+                result.put(peer, new long[]{
+                        nextIndex.getOrDefault(peer, lastLogIndex() + 1),
+                        matchIndex.getOrDefault(peer, 0L)});
+            }
+        }
+        return result;
     }
 }

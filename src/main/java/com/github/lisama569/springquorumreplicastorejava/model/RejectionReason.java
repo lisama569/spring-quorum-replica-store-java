@@ -15,5 +15,11 @@ public enum RejectionReason {
     /** 节点被暂停/隔离，不可服务。 */
     NODE_UNAVAILABLE,
     /** 重复请求，直接返回首次结果，不产生新状态变更。 */
-    DUPLICATE_REQUEST
+    DUPLICATE_REQUEST,
+    /** 条件写入的期望版本与当前实际版本不一致。 */
+    VERSION_MISMATCH,
+    /** 目标键不存在（读取未命中 / 条件写入前置了已存在的版本）。 */
+    KEY_NOT_FOUND,
+    /** 同一请求标识再次提交但内容与首次不一致。 */
+    REQUEST_CONFLICT
 }

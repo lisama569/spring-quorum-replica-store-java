@@ -3,6 +3,7 @@ package com.github.lisama569.springquorumreplicastorejava.api;
 import com.github.lisama569.springquorumreplicastorejava.cluster.Cluster;
 import com.github.lisama569.springquorumreplicastorejava.model.NodeStatus;
 import com.github.lisama569.springquorumreplicastorejava.model.ReadOutcome;
+import com.github.lisama569.springquorumreplicastorejava.model.ReplicationStatus;
 import com.github.lisama569.springquorumreplicastorejava.model.WriteOutcome;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -30,8 +31,17 @@ public class ClusterController {
         this.cluster = cluster;
     }
 
-    /** 写请求体。requestId 缺省时由服务端生成（不提供幂等去重）。 */
-    public record WriteRequest(String key, String value, String requestId) {
+    /**
+     * 写请求体。requestId 缺省时由服务端生成（不提供幂等去重）。
+     * expectedVersion / clientTerm 为可选：缺省时保持旧的无条件写入语义。
+     */
+    public record WriteRequest(String key, String value, String requestId,
+                               Long expectedVersion, Long clientTerm) {
+    }
+
+    /** 删除请求体：与写入共用受版本约束的路径。 */
+    public record DeleteRequest(String key, String requestId,
+                                Long expectedVersion, Long clientTerm) {
     }
 
     /** 分区请求体。 */
@@ -42,9 +52,25 @@ public class ClusterController {
     public ResponseEntity<WriteOutcome> write(@RequestBody WriteRequest request) {
         String requestId = request.requestId() != null ? request.requestId()
                 : UUID.randomUUID().toString();
-        WriteOutcome outcome = cluster.write(request.key(), request.value(), requestId);
+        WriteOutcome outcome = cluster.write(request.key(), request.value(), requestId,
+                request.expectedVersion(), request.clientTerm());
         return outcome.success() ? ResponseEntity.ok(outcome)
                 : ResponseEntity.status(HttpStatus.CONFLICT).body(outcome);
+    }
+
+    @PostMapping("/delete")
+    public ResponseEntity<WriteOutcome> delete(@RequestBody DeleteRequest request) {
+        String requestId = request.requestId() != null ? request.requestId()
+                : UUID.randomUUID().toString();
+        WriteOutcome outcome = cluster.delete(request.key(), requestId,
+                request.expectedVersion(), request.clientTerm());
+        return outcome.success() ? ResponseEntity.ok(outcome)
+                : ResponseEntity.status(HttpStatus.CONFLICT).body(outcome);
+    }
+
+    @GetMapping("/replication")
+    public ReplicationStatus replication() {
+        return cluster.replicationStatus();
     }
 
     @GetMapping("/read")

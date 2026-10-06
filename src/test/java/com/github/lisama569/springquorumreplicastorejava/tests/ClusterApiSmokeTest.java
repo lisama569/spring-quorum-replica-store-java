@@ -99,4 +99,78 @@ class ClusterApiSmokeTest {
                 base("/api/cluster/fault/resume/n3"), null, String.class);
         assertEquals(HttpStatus.OK, resume.getStatusCode());
     }
+
+    @Test
+    void versionedWriteDeleteAndReplicationOverHttp() throws Exception {
+        // 等待主节点
+        String leader = null;
+        for (int i = 0; i < 60; i++) {
+            JsonNode body = mapper.readTree(
+                    rest.getForEntity(base("/api/cluster/leader"), String.class).getBody());
+            if (!"none".equals(body.get("leader").asText())) {
+                leader = body.get("leader").asText();
+                break;
+            }
+            Thread.sleep(50);
+        }
+        assertNotNull(leader);
+
+        // 条件写：期望不存在（版本 0）→ 创建成功，返回新版本 1
+        ResponseEntity<String> create = rest.postForEntity(base("/api/cluster/write"),
+                new HttpEntity<>(Map.of("key", "vk", "value", "v1", "requestId", "vw-1",
+                        "expectedVersion", 0)), String.class);
+        JsonNode createBody = mapper.readTree(create.getBody());
+        assertTrue(createBody.get("success").asBoolean());
+        assertEquals(1, createBody.get("version").asLong());
+
+        // 条件写：版本不匹配 → 409 VERSION_MISMATCH，并带回当前版本
+        ResponseEntity<String> mismatch = rest.postForEntity(base("/api/cluster/write"),
+                new HttpEntity<>(Map.of("key", "vk", "value", "v2", "requestId", "vw-2",
+                        "expectedVersion", 7)), String.class);
+        assertEquals(HttpStatus.CONFLICT, mismatch.getStatusCode());
+        JsonNode mismatchBody = mapper.readTree(mismatch.getBody());
+        assertEquals("VERSION_MISMATCH", mismatchBody.get("reason").asText());
+        assertEquals(1, mismatchBody.get("currentVersion").asLong());
+
+        // 落后任期 → 409 STALE_TERM
+        ResponseEntity<String> stale = rest.postForEntity(base("/api/cluster/write"),
+                new HttpEntity<>(Map.of("key", "vk", "value", "v2", "requestId", "vw-3",
+                        "clientTerm", 0)), String.class);
+        assertEquals(HttpStatus.CONFLICT, stale.getStatusCode());
+        assertEquals("STALE_TERM", mapper.readTree(stale.getBody()).get("reason").asText());
+
+        // 同 requestId 不同内容 → 409 REQUEST_CONFLICT
+        ResponseEntity<String> conflict = rest.postForEntity(base("/api/cluster/write"),
+                new HttpEntity<>(Map.of("key", "vk", "value", "other", "requestId", "vw-1",
+                        "expectedVersion", 0)), String.class);
+        assertEquals(HttpStatus.CONFLICT, conflict.getStatusCode());
+        assertEquals("REQUEST_CONFLICT",
+                mapper.readTree(conflict.getBody()).get("reason").asText());
+
+        // 读取带版本；条件删除；删除后未命中但 found 字段可区分
+        JsonNode readBody = mapper.readTree(rest.getForEntity(
+                base("/api/cluster/read?key=vk&requestId=vw-read-1"), String.class).getBody());
+        assertTrue(readBody.get("found").asBoolean());
+        long version = readBody.get("version").asLong();
+
+        ResponseEntity<String> delete = rest.postForEntity(base("/api/cluster/delete"),
+                new HttpEntity<>(Map.of("key", "vk", "requestId", "vw-del-1",
+                        "expectedVersion", version)), String.class);
+        assertEquals(HttpStatus.OK, delete.getStatusCode());
+        JsonNode gone = mapper.readTree(rest.getForEntity(
+                base("/api/cluster/read?key=vk&requestId=vw-read-2"), String.class).getBody());
+        assertTrue(gone.get("success").asBoolean());
+        assertTrue(!gone.get("found").asBoolean());
+
+        // 复制进度观测字段
+        JsonNode replication = mapper.readTree(
+                rest.getForEntity(base("/api/cluster/replication"), String.class).getBody());
+        assertEquals(leader, replication.get("leaderId").asText());
+        assertTrue(replication.get("followers").isArray());
+        JsonNode follower = replication.get("followers").get(0);
+        assertNotNull(follower.get("nextIndex"));
+        assertNotNull(follower.get("matchIndex"));
+        assertNotNull(follower.get("lag"));
+        assertNotNull(follower.get("state"));
+    }
 }

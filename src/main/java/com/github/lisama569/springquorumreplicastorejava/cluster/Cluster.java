@@ -1,8 +1,11 @@
 package com.github.lisama569.springquorumreplicastorejava.cluster;
 
+import com.github.lisama569.springquorumreplicastorejava.model.FollowerReplication;
 import com.github.lisama569.springquorumreplicastorejava.model.NodeStatus;
 import com.github.lisama569.springquorumreplicastorejava.model.ReadOutcome;
 import com.github.lisama569.springquorumreplicastorejava.model.RejectionReason;
+import com.github.lisama569.springquorumreplicastorejava.model.ReplicationState;
+import com.github.lisama569.springquorumreplicastorejava.model.ReplicationStatus;
 import com.github.lisama569.springquorumreplicastorejava.model.Role;
 import com.github.lisama569.springquorumreplicastorejava.model.WriteOutcome;
 import com.github.lisama569.springquorumreplicastorejava.rpc.Envelope;
@@ -95,6 +98,17 @@ public class Cluster {
 
     /** 客户端写：路由到当前主节点。 */
     public WriteOutcome write(String key, String value, String requestId) {
+        return write(key, value, requestId, null, null);
+    }
+
+    /**
+     * 客户端写（可携带期望版本与客户端任期）：路由到当前主节点。
+     *
+     * @param expectedVersion 期望的键当前版本；null 表示无条件写入
+     * @param clientTerm      调用方缓存的任期；null 表示不携带
+     */
+    public WriteOutcome write(String key, String value, String requestId,
+                              Long expectedVersion, Long clientTerm) {
         synchronized (lock) {
             ReplicaNode leader = findLeader();
             if (leader == null) {
@@ -102,7 +116,21 @@ public class Cluster {
                 return WriteOutcome.rejected(requestId, -1, -1,
                         RejectionReason.NO_QUORUM, "no leader elected");
             }
-            return leader.clientWrite(key, value, requestId);
+            return leader.clientWrite(key, value, requestId, expectedVersion, clientTerm, false);
+        }
+    }
+
+    /** 客户端删除：与写入共用同一条受版本约束的路径。 */
+    public WriteOutcome delete(String key, String requestId,
+                               Long expectedVersion, Long clientTerm) {
+        synchronized (lock) {
+            ReplicaNode leader = findLeader();
+            if (leader == null) {
+                log.info("event=delete-rejected requestId={} reason=no-leader", requestId);
+                return WriteOutcome.rejected(requestId, -1, -1,
+                        RejectionReason.NO_QUORUM, "no leader elected");
+            }
+            return leader.clientWrite(key, "", requestId, expectedVersion, clientTerm, true);
         }
     }
 
@@ -153,8 +181,46 @@ public class Cluster {
         }
     }
 
-    /** 暂停节点（消息层面隔离，不修改节点状态）。 */
-    public void pauseNode(String nodeId) {
+    /**
+     * 主节点视角的复制进度：各从副本的 nextIndex/matchIndex/落后量与状态。
+     * 状态区分：BLOCKED（暂停或分区）、DOWN（已崩溃）、CATCHING_UP（可达但落后）、IN_SYNC。
+     */
+    public ReplicationStatus replicationStatus() {
+        synchronized (lock) {
+            ReplicaNode leader = findLeader();
+            if (leader == null) {
+                return new ReplicationStatus(null, -1, -1, -1, List.of());
+            }
+            NodeStatus leaderStatus = leader.status();
+            long lastLogIndex = leaderStatus.logSize();
+            Set<String> paused = bus.pausedNodes();
+            Map<String, long[]> progress = leader.followerProgress();
+            List<FollowerReplication> followers = new ArrayList<>();
+            for (Map.Entry<String, long[]> e : progress.entrySet()) {
+                String followerId = e.getKey();
+                long next = e.getValue()[0];
+                long match = e.getValue()[1];
+                NodeStatus fs = nodes.get(followerId).status();
+                ReplicationState state;
+                if (!fs.alive()) {
+                    state = ReplicationState.DOWN;
+                } else if (paused.contains(followerId)
+                        || !bus.reachable(leaderStatus.nodeId(), followerId)) {
+                    state = ReplicationState.BLOCKED;
+                } else if (match >= lastLogIndex) {
+                    state = ReplicationState.IN_SYNC;
+                } else {
+                    state = ReplicationState.CATCHING_UP;
+                }
+                followers.add(new FollowerReplication(followerId, next, match,
+                        Math.max(0, lastLogIndex - match), state));
+            }
+            return new ReplicationStatus(leaderStatus.nodeId(), leaderStatus.currentTerm(),
+                    leaderStatus.commitIndex(), lastLogIndex, followers);
+        }
+    }
+
+    /** 暂停节点（消息层面隔离，不修改节点状态）。 */    public void pauseNode(String nodeId) {
         bus.pause(nodeId);
     }
 

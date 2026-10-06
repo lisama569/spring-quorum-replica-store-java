@@ -145,6 +145,11 @@ public class MessageBus {
         }
     }
 
+    /** 两节点间当前是否可投递（均未暂停且未被分区隔开）。 */
+    public boolean reachable(String from, String to) {
+        return !paused.contains(from) && !paused.contains(to) && !isPartitioned(from, to);
+    }
+
     /** 当前被暂停的节点集合（只读视图）。 */
     public Set<String> pausedNodes() {
         return Set.copyOf(paused);
