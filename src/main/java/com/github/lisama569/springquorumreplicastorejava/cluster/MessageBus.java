@@ -150,6 +150,11 @@ public class MessageBus {
         return Set.copyOf(paused);
     }
 
+    /** from 当前能否把消息投递到 to（双方未暂停且不在分区两侧）。 */
+    public boolean canReach(String from, String to) {
+        return !paused.contains(from) && !paused.contains(to) && !isPartitioned(from, to);
+    }
+
     /** 该节点当前能否与多数派节点互通（自身计入）。 */
     public boolean isReachableFromQuorum(String nodeId) {
         int total = handlers.size();

@@ -14,6 +14,7 @@ import org.springframework.http.ResponseEntity;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -65,6 +66,47 @@ class ClusterApiSmokeTest {
         assertEquals(HttpStatus.OK, read.getStatusCode());
         JsonNode readBody = mapper.readTree(read.getBody());
         assertEquals("http-v", readBody.get("value").asText());
+        assertTrue(readBody.get("found").asBoolean());
+        assertEquals(1, readBody.get("version").asLong());
+
+        // 条件写入：版本不匹配应 409 VERSION_MISMATCH 并带回实际版本
+        Map<String, Object> casMiss = Map.of("key", "http-k", "value", "x",
+                "requestId", "http-req-cas", "expectedVersion", 9);
+        ResponseEntity<String> miss = rest.postForEntity(base("/api/cluster/write"),
+                new HttpEntity<>(casMiss), String.class);
+        assertEquals(HttpStatus.CONFLICT, miss.getStatusCode());
+        JsonNode missBody = mapper.readTree(miss.getBody());
+        assertEquals("VERSION_MISMATCH", missBody.get("reason").asText());
+        assertEquals(1, missBody.get("version").asLong());
+
+        // 条件写入：版本匹配应生效并推进版本
+        Map<String, Object> casHit = Map.of("key", "http-k", "value", "http-v2",
+                "requestId", "http-req-cas2", "expectedVersion", 1);
+        ResponseEntity<String> hit = rest.postForEntity(base("/api/cluster/write"),
+                new HttpEntity<>(casHit), String.class);
+        assertEquals(HttpStatus.OK, hit.getStatusCode());
+        assertEquals(2, mapper.readTree(hit.getBody()).get("version").asLong());
+
+        // 复制进度观测
+        ResponseEntity<String> replication = rest.getForEntity(
+                base("/api/cluster/replication"), String.class);
+        assertEquals(HttpStatus.OK, replication.getStatusCode());
+        JsonNode replBody = mapper.readTree(replication.getBody());
+        assertEquals(leader, replBody.get("leaderId").asText());
+        assertEquals(2, replBody.get("followers").size());
+        assertNotNull(replBody.get("followers").get(0).get("state"));
+
+        // 受版本约束的删除
+        Map<String, Object> del = Map.of("key", "http-k", "requestId", "http-req-del",
+                "expectedVersion", 2);
+        ResponseEntity<String> deleted = rest.postForEntity(base("/api/cluster/delete"),
+                new HttpEntity<>(del), String.class);
+        assertEquals(HttpStatus.OK, deleted.getStatusCode());
+        JsonNode afterDelete = mapper.readTree(rest.getForEntity(
+                base("/api/cluster/read?key=http-k&requestId=http-read-2"), String.class)
+                .getBody());
+        assertFalse(afterDelete.get("found").asBoolean(), "删除后键不存在");
+        assertEquals(3, afterDelete.get("version").asLong(), "删除后版本保留（墓碑）");
 
         // 观测字段
         ResponseEntity<String> status = rest.getForEntity(base("/api/cluster/status"), String.class);
